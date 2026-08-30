@@ -1,0 +1,54 @@
+# RBAC - least privilege.
+#
+# healthapp-sa is the identity the application pods run under. It is granted
+# NOTHING, and the pod spec also refuses to mount its API token. If the
+# container is ever compromised, the attacker gains no access to the cluster.
+#
+# ci-deployer is the identity a CI system would use. It can manage the
+# workload in this namespace only, and cannot read Secrets or touch any
+# other namespace.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: healthapp-sa
+  namespace: healthcare
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-deployer
+  namespace: healthcare
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer-role
+  namespace: healthcare
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "patch", "update"]
+- apiGroups: [""]
+  resources: ["services", "pods"]
+  verbs: ["get", "list"]
+# Deliberately absent: secrets, delete, cluster-scoped resources,
+# and any access outside the healthcare namespace.
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deployer-binding
+  namespace: healthcare
+subjects:
+- kind: ServiceAccount
+  name: ci-deployer
+  namespace: healthcare
+roleRef:
+  kind: Role
+  name: deployer-role
+  apiGroup: rbac.authorization.k8s.io

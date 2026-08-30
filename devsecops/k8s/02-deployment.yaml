@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: healthapp-secure
+  namespace: healthcare
+  labels:
+    app: healthapp-secure
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: healthapp-secure
+  template:
+    metadata:
+      labels:
+        app: healthapp-secure
+    spec:
+      serviceAccountName: healthapp-sa
+      automountServiceAccountToken: false
+
+      # Pod level security context - nothing in this pod runs as root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+      - name: healthapp
+        image: prady200545/healthapp-secure:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5000
+
+        # Container level security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          privileged: false
+          capabilities:
+            drop: ["ALL"]
+
+        env:
+        - name: APP_VERSION
+          value: "v1"
+        # The API key never appears in this file. It is read from a Secret
+        # that the pipeline creates from the Jenkins credential store.
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: patient-api-credentials
+              key: API_KEY
+
+        # Resource limits - stops one compromised pod starving the node
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+
+        # Writable scratch space, since the root filesystem is read-only
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+      volumes:
+      - name: tmp
+        emptyDir: {}

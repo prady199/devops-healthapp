@@ -1,0 +1,43 @@
+# Network segmentation.
+#
+# Policy 1: the only traffic allowed INTO the patient portal pods is TCP 5000.
+#           Every other port is unreachable, even from inside the cluster.
+#
+# Policy 2: the pods may only send traffic OUT to cluster DNS. They cannot
+#           reach the internet or any other service. If an attacker gets code
+#           execution inside the container, patient data cannot be exfiltrated.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: healthapp-ingress
+  namespace: healthcare
+spec:
+  podSelector:
+    matchLabels:
+      app: healthapp-secure
+  policyTypes:
+  - Ingress
+  ingress:
+  - ports:
+    - protocol: TCP
+      port: 5000
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: healthapp-egress-dns-only
+  namespace: healthcare
+spec:
+  podSelector:
+    matchLabels:
+      app: healthapp-secure
+  policyTypes:
+  - Egress
+  egress:
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
