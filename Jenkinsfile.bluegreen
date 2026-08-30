@@ -1,0 +1,129 @@
+pipeline {
+  agent any
+
+  environment {
+    IMAGE      = "prady200545/healthapp"
+    TAG        = "${env.BUILD_NUMBER}"
+    KUBECONFIG = "/var/lib/jenkins/.kube/config"
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Ensure Environments Exist') {
+      steps {
+        sh 'kubectl apply -f k8s-bluegreen/blue-deployment.yaml'
+        sh 'kubectl apply -f k8s-bluegreen/green-deployment.yaml'
+        sh 'kubectl get svc healthapp-svc >/dev/null 2>&1 || kubectl apply -f k8s-bluegreen/services.yaml'
+      }
+    }
+
+    stage('Detect Live Environment') {
+      steps {
+        script {
+          env.LIVE = sh(
+            script: "kubectl get svc healthapp-svc -o jsonpath='{.spec.selector.version}'",
+            returnStdout: true
+          ).trim()
+          env.TARGET = (env.LIVE == 'blue') ? 'green' : 'blue'
+          echo "LIVE environment  : ${env.LIVE}"
+          echo "TARGET (idle) env : ${env.TARGET}"
+        }
+      }
+    }
+
+    stage('Build and Push Image') {
+      steps {
+        sh 'docker build -t $IMAGE:$TAG -t $IMAGE:latest .'
+        withCredentials([usernamePassword(credentialsId: 'dockerhub',
+            usernameVariable: 'DU', passwordVariable: 'DP')]) {
+          sh 'echo $DP | docker login -u $DU --password-stdin'
+          sh 'docker push $IMAGE:$TAG'
+          sh 'docker push $IMAGE:latest'
+        }
+      }
+    }
+
+    stage('Deploy to Idle Environment') {
+      steps {
+        sh '''
+          kubectl set env deployment/healthapp-$TARGET APP_VERSION=build-$TAG
+          kubectl set image deployment/healthapp-$TARGET healthapp=$IMAGE:$TAG
+          kubectl rollout status deployment/healthapp-$TARGET --timeout=180s
+        '''
+      }
+    }
+
+    stage('Point Preview at Idle') {
+      steps {
+        sh '''
+          kubectl patch svc healthapp-preview \
+            -p '{"spec":{"selector":{"app":"healthapp","version":"'$TARGET'"}}}'
+        '''
+      }
+    }
+
+    stage('Smoke Test Idle Environment') {
+      steps {
+        sh '''
+          echo "Testing $TARGET on preview port 30081 before sending users to it"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -sf http://localhost:30081/health; then
+              echo ""
+              echo "SMOKE TEST PASSED - $TARGET is healthy"
+              exit 0
+            fi
+            echo "attempt $i - not ready yet, retrying"
+            sleep 5
+          done
+          echo "SMOKE TEST FAILED - aborting, users stay on $LIVE"
+          exit 1
+        '''
+      }
+    }
+
+    stage('Switch Live Traffic') {
+      steps {
+        sh '''
+          echo "Switching live traffic from $LIVE to $TARGET"
+          kubectl patch svc healthapp-svc \
+            -p '{"spec":{"selector":{"app":"healthapp","version":"'$TARGET'"}}}'
+          kubectl patch svc healthapp-preview \
+            -p '{"spec":{"selector":{"app":"healthapp","version":"'$LIVE'"}}}'
+        '''
+      }
+    }
+
+    stage('Verify Switch') {
+      steps {
+        sh '''
+          echo "----- LIVE selector now -----"
+          kubectl get svc healthapp-svc -o jsonpath='{.spec.selector.version}'
+          echo ""
+          echo "----- Response from live service (30080) -----"
+          curl -s http://localhost:30080/health
+          echo ""
+          echo "----- Response from old version, still running (30081) -----"
+          curl -s http://localhost:30081/health
+          echo ""
+          kubectl get pods -l app=healthapp -L version
+        '''
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Blue-green switch complete. Live = $TARGET, standby = $LIVE."
+      echo "Rollback command: kubectl patch svc healthapp-svc -p '{\"spec\":{\"selector\":{\"app\":\"healthapp\",\"version\":\"$LIVE\"}}}'"
+    }
+    failure {
+      echo "Deployment failed. Live traffic never left $LIVE - zero user impact."
+    }
+  }
+}
