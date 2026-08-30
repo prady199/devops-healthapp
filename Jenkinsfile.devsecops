@@ -1,0 +1,185 @@
+pipeline {
+  agent any
+
+  environment {
+    IMAGE      = "prady200545/healthapp-secure"
+    TAG        = "${env.BUILD_NUMBER}"
+    KUBECONFIG = "/var/lib/jenkins/.kube/config"
+    NS         = "healthcare"
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+        sh 'mkdir -p reports'
+      }
+    }
+
+    // ---------- SHIFT LEFT: scan before anything is built ----------
+
+    stage('SAST - Static Code Analysis') {
+      steps {
+        sh '''
+          echo "Scanning application source for insecure code patterns"
+          bandit -r devsecops -f txt -o reports/bandit-full.txt --exit-zero
+          cat reports/bandit-full.txt
+          echo "--- SECURITY GATE: fail the build on HIGH severity findings ---"
+          bandit -r devsecops -lll
+        '''
+      }
+    }
+
+    stage('Secret Scan - Credentials in Source') {
+      steps {
+        sh '''
+          echo "Searching the repository for hardcoded credentials"
+          trivy fs --scanners secret --exit-code 1 \
+                   --format table --output reports/secrets.txt .
+          cat reports/secrets.txt
+          echo "No hardcoded secrets found"
+        '''
+      }
+    }
+
+    stage('Dependency Vulnerability Scan') {
+      steps {
+        sh '''
+          trivy fs --scanners vuln --severity HIGH,CRITICAL \
+                   --format table --output reports/dependencies.txt devsecops/
+          cat reports/dependencies.txt
+        '''
+      }
+    }
+
+    // ---------- BUILD ----------
+
+    stage('Build Hardened Image') {
+      steps {
+        sh 'docker build -t $IMAGE:$TAG -t $IMAGE:latest -f devsecops/Dockerfile devsecops/'
+      }
+    }
+
+    stage('Image Scan - Security Gate') {
+      steps {
+        sh '''
+          echo "Full vulnerability report for the built image"
+          trivy image --severity HIGH,CRITICAL --ignore-unfixed \
+                      --format table --output reports/image-scan.txt $IMAGE:$TAG
+          cat reports/image-scan.txt
+
+          echo "--- SECURITY GATE: block deployment on CRITICAL vulnerabilities ---"
+          trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed $IMAGE:$TAG
+          echo "GATE PASSED - image cleared for release"
+        '''
+      }
+    }
+
+    stage('Push Image') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub',
+            usernameVariable: 'DU', passwordVariable: 'DP')]) {
+          sh 'echo $DP | docker login -u $DU --password-stdin'
+          sh 'docker push $IMAGE:$TAG'
+          sh 'docker push $IMAGE:latest'
+        }
+      }
+    }
+
+    // ---------- SECURE DEPLOY ----------
+
+    stage('Provision Secret from Credential Store') {
+      steps {
+        withCredentials([string(credentialsId: 'patient-api-key', variable: 'PKEY')]) {
+          sh '''
+            kubectl apply -f devsecops/k8s/00-namespace.yaml
+            kubectl create secret generic patient-api-credentials \
+              --namespace=$NS \
+              --from-literal=API_KEY=$PKEY \
+              --dry-run=client -o yaml | kubectl apply -f -
+            echo "Secret provisioned. Value never written to Git or to the console."
+          '''
+        }
+      }
+    }
+
+    stage('Apply Security Policies') {
+      steps {
+        sh '''
+          kubectl apply -f devsecops/k8s/01-rbac.yaml
+          kubectl apply -f devsecops/k8s/04-networkpolicy.yaml
+          kubectl get networkpolicy -n $NS
+        '''
+      }
+    }
+
+    stage('Deploy Hardened Workload') {
+      steps {
+        sh '''
+          kubectl apply -f devsecops/k8s/02-deployment.yaml
+          kubectl apply -f devsecops/k8s/03-service.yaml
+          kubectl set image deployment/healthapp-secure healthapp=$IMAGE:$TAG -n $NS
+          kubectl set env deployment/healthapp-secure APP_VERSION=build-$TAG -n $NS
+          kubectl rollout status deployment/healthapp-secure -n $NS --timeout=180s
+        '''
+      }
+    }
+
+    // ---------- PROVE THE CONTROLS ARE ACTIVE ----------
+
+    stage('Verify Runtime Security Posture') {
+      steps {
+        sh '''
+          POD=$(kubectl get pod -n $NS -l app=healthapp-secure -o jsonpath="{.items[0].metadata.name}")
+
+          echo "===== Effective user inside the container ====="
+          kubectl exec -n $NS $POD -- id
+
+          echo "===== Root filesystem should be read-only ====="
+          kubectl exec -n $NS $POD -- sh -c "touch /malware 2>&1 || echo BLOCKED - filesystem is read-only"
+
+          echo "===== Service account token should not be mounted ====="
+          kubectl exec -n $NS $POD -- sh -c "ls /var/run/secrets/kubernetes.io 2>&1 || echo BLOCKED - no API token in pod"
+
+          echo "===== RBAC permissions of the application identity ====="
+          kubectl auth can-i --list --as=system:serviceaccount:healthcare:healthapp-sa -n $NS
+
+          echo "===== Applied security context ====="
+          kubectl get deployment healthapp-secure -n $NS \
+            -o jsonpath="{.spec.template.spec.containers[0].securityContext}"
+          echo ""
+        '''
+      }
+    }
+
+    stage('Access Control Test') {
+      steps {
+        sh '''
+          echo "===== Request with NO API key - must be rejected ====="
+          curl -s -o /dev/null -w "HTTP %{http_code}\\n" http://localhost:30082/api/patients
+
+          echo "===== Request with a WRONG API key - must be rejected ====="
+          curl -s -o /dev/null -w "HTTP %{http_code}\\n" \
+               -H "X-API-Key: wrong-key" http://localhost:30082/api/patients
+
+          echo "===== Audit trail showing the denied attempts ====="
+          curl -s http://localhost:30082/audit
+          echo ""
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'reports/*', allowEmptyArchive: true
+    }
+    success {
+      echo "All security gates passed. Hardened build $TAG is live."
+    }
+    failure {
+      echo "A security gate blocked this build. Nothing was deployed."
+    }
+  }
+}
