@@ -1,0 +1,31 @@
+# LIVE service - this is what real users hit (port 30080).
+# The pipeline flips its selector between blue and green.
+apiVersion: v1
+kind: Service
+metadata:
+  name: healthapp-svc
+spec:
+  type: NodePort
+  selector:
+    app: healthapp
+    version: blue
+  ports:
+  - port: 80
+    targetPort: 5000
+    nodePort: 30080
+---
+# PREVIEW service - always points at the IDLE environment (port 30081).
+# Used to smoke test the new version before sending users to it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: healthapp-preview
+spec:
+  type: NodePort
+  selector:
+    app: healthapp
+    version: green
+  ports:
+  - port: 80
+    targetPort: 5000
+    nodePort: 30081
