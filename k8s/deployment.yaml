@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: healthapp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: healthapp
+  template:
+    metadata:
+      labels:
+        app: healthapp
+    spec:
+      containers:
+      - name: healthapp
+        image: prady200545/healthapp:latest
+        ports:
+        - containerPort: 5000
+        env:
+        - name: APP_VERSION
+          value: "v1"
+        - name: APP_COLOR
+          value: "blue"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
